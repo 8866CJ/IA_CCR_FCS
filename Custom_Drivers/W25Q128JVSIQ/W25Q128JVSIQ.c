@@ -2,185 +2,301 @@
 #include "main.h"
 #include <string.h>
 
-#define CMD_WRITE_ENABLE   0x06
-#define CMD_READ_SR1       0x05
-#define CMD_READ_DATA      0x03
-#define CMD_PAGE_PROGRAM   0x02
-#define CMD_SECTOR_ERASE   0x20
-#define CMD_BLOCK64_ERASE  0xD8
-#define CMD_CHIP_ERASE     0xC7
-#define CMD_JEDEC_ID       0x9F
+// Command bytes (see the "Instructions" section of the W25Q128JV datasheet)
+#define CMD_WRITE_ENABLE    0x06
+#define CMD_READ_STATUS     0x05
+#define CMD_READ_DATA       0x03
+#define CMD_PAGE_PROGRAM    0x02
+#define CMD_SECTOR_ERASE    0x20
+#define CMD_BLOCK_ERASE     0xD8
+#define CMD_CHIP_ERASE      0xC7
+#define CMD_READ_ID         0x9F
 
-#define SR1_BUSY           0x01
+#define STATUS_BUSY         0x01    // bit 0 of the status register is 1 while the chip is busy
 
-/* Max times from the datasheet AC table, plus margin for 1 ms HAL tick. */
-#define SPI_TIMEOUT_MS         100u
-#define PAGE_PROGRAM_MS        5u
-#define SECTOR_ERASE_MS        450u
-#define BLOCK64_ERASE_MS       2100u
-#define CHIP_ERASE_MS          200000u
+// Timeouts in ms, a little longer than the worst case times in the datasheet
+#define SPI_TIMEOUT             100
+#define PAGE_WRITE_TIMEOUT      5
+#define SECTOR_ERASE_TIMEOUT    500
+#define BLOCK_ERASE_TIMEOUT     2500
+#define CHIP_ERASE_TIMEOUT      200000
 
-static void cs_low(W25Q_t *d)  { HAL_GPIO_WritePin(d->cs_port, d->cs_pin, GPIO_PIN_RESET); }
-static void cs_high(W25Q_t *d) { HAL_GPIO_WritePin(d->cs_port, d->cs_pin, GPIO_PIN_SET); }
 
-/* One CS-framed transaction: send hdr, then send len bytes of tx OR receive len bytes into rx. */
-static HAL_StatusTypeDef xfer(W25Q_t *d, const uint8_t *hdr, uint16_t hdr_len,
-                              const uint8_t *tx, uint8_t *rx, uint16_t len)
+static void chip_select(W25Q_Handle *flash)
 {
-    cs_low(d);
-    HAL_StatusTypeDef st = HAL_SPI_Transmit(d->hspi, (uint8_t *)hdr, hdr_len, SPI_TIMEOUT_MS);
-    if (st == HAL_OK && len) {
-        st = tx ? HAL_SPI_Transmit(d->hspi, (uint8_t *)tx, len, SPI_TIMEOUT_MS)
-                : HAL_SPI_Receive(d->hspi, rx, len, SPI_TIMEOUT_MS);
+    HAL_GPIO_WritePin(flash->cs_port, flash->cs_pin, GPIO_PIN_RESET);
+}
+
+static void chip_deselect(W25Q_Handle *flash)
+{
+    HAL_GPIO_WritePin(flash->cs_port, flash->cs_pin, GPIO_PIN_SET);
+}
+
+// Sends a command followed by a 3 byte address (most significant byte first)
+static HAL_StatusTypeDef send_command_with_address(W25Q_Handle *flash, uint8_t command, uint32_t address)
+{
+    uint8_t bytes[4];
+    bytes[0] = command;
+    bytes[1] = (address >> 16) & 0xFF;
+    bytes[2] = (address >> 8) & 0xFF;
+    bytes[3] = address & 0xFF;
+    return HAL_SPI_Transmit(flash->spi, bytes, 4, SPI_TIMEOUT);
+}
+
+// Sends a single command byte on its own (CS goes low, byte, CS goes high)
+static HAL_StatusTypeDef send_single_command(W25Q_Handle *flash, uint8_t command)
+{
+    chip_select(flash);
+    HAL_StatusTypeDef result = HAL_SPI_Transmit(flash->spi, &command, 1, SPI_TIMEOUT);
+    chip_deselect(flash);
+    return result;
+}
+
+// The chip has to be told "write enable" before every write or erase
+static HAL_StatusTypeDef write_enable(W25Q_Handle *flash)
+{
+    return send_single_command(flash, CMD_WRITE_ENABLE);
+}
+
+// Keeps checking the status register until the chip is done with a write/erase
+static HAL_StatusTypeDef wait_until_ready(W25Q_Handle *flash, uint32_t timeout_ms)
+{
+    uint8_t command = CMD_READ_STATUS;
+    uint8_t status = 0;
+    uint32_t start_time = HAL_GetTick();
+
+    while (HAL_GetTick() - start_time < timeout_ms) {
+        chip_select(flash);
+        HAL_StatusTypeDef result = HAL_SPI_Transmit(flash->spi, &command, 1, SPI_TIMEOUT);
+        if (result == HAL_OK) {
+            result = HAL_SPI_Receive(flash->spi, &status, 1, SPI_TIMEOUT);
+        }
+        chip_deselect(flash);
+
+        if (result != HAL_OK) {
+            return result;
+        }
+        if ((status & STATUS_BUSY) == 0) {
+            return HAL_OK;
+        }
     }
-    cs_high(d);
-    return st;
-}
-
-static void addr_cmd(uint8_t hdr[4], uint8_t cmd, uint32_t addr)
-{
-    hdr[0] = cmd;
-    hdr[1] = (uint8_t)(addr >> 16);
-    hdr[2] = (uint8_t)(addr >> 8);
-    hdr[3] = (uint8_t)addr;
-}
-
-static int in_range(uint32_t addr, uint32_t len)
-{
-    return addr < W25Q_FLASH_SIZE && len <= W25Q_FLASH_SIZE - addr;
-}
-
-static HAL_StatusTypeDef wait_ready(W25Q_t *d, uint32_t timeout_ms)
-{
-    uint8_t cmd = CMD_READ_SR1, sr;
-    uint32_t start = HAL_GetTick();
-    do {
-        if (xfer(d, &cmd, 1, NULL, &sr, 1) != HAL_OK) return HAL_ERROR;
-        if (!(sr & SR1_BUSY)) return HAL_OK;
-    } while (HAL_GetTick() - start < timeout_ms);
     return HAL_TIMEOUT;
 }
 
-static HAL_StatusTypeDef write_enable(W25Q_t *d)
+// Makes sure we don't try to read/write past the end of the chip
+static int is_valid_range(uint32_t address, uint32_t length)
 {
-    uint8_t cmd = CMD_WRITE_ENABLE;
-    return xfer(d, &cmd, 1, NULL, NULL, 0);
+    return address < W25Q_TOTAL_SIZE && length <= W25Q_TOTAL_SIZE - address;
 }
 
-static HAL_StatusTypeDef erase(W25Q_t *d, uint8_t cmd, uint32_t addr, uint32_t timeout_ms)
-{
-    uint8_t hdr[4];
-    addr_cmd(hdr, cmd, addr);
-    uint16_t n = (cmd == CMD_CHIP_ERASE) ? 1 : 4;   /* chip erase has no address */
-    if (write_enable(d) != HAL_OK || xfer(d, hdr, n, NULL, NULL, 0) != HAL_OK) return HAL_ERROR;
-    return wait_ready(d, timeout_ms);
-}
 
-HAL_StatusTypeDef W25Q_ReadJEDECID(W25Q_t *dev, uint32_t *id)
+HAL_StatusTypeDef W25Q_ReadID(W25Q_Handle *flash, uint32_t *id)
 {
-    uint8_t cmd = CMD_JEDEC_ID, b[3];
-    HAL_StatusTypeDef st = xfer(dev, &cmd, 1, NULL, b, 3);
-    *id = ((uint32_t)b[0] << 16) | ((uint32_t)b[1] << 8) | b[2];
-    return st;
-}
+    uint8_t command = CMD_READ_ID;
+    uint8_t id_bytes[3] = {0};
 
-/* *last = index of last non-0xFF byte in the page, or -1 if the page is fully erased. */
-static HAL_StatusTypeDef page_last_used(W25Q_t *d, uint32_t page, int32_t *last)
-{
-    uint8_t buf[W25Q_PAGE_SIZE];
-    if (W25Q_Read(d, page * W25Q_PAGE_SIZE, buf, W25Q_PAGE_SIZE) != HAL_OK) return HAL_ERROR;
-    *last = (int32_t)W25Q_PAGE_SIZE - 1;
-    while (*last >= 0 && buf[*last] == 0xFF) (*last)--;
-    return HAL_OK;
-}
-
-/* Every page with log data has a non-0xFF len byte, so pages go
- * used, used, ..., used, erased, ..., erased. Binary search the boundary. */
-static HAL_StatusTypeDef find_log_end(W25Q_t *d)
-{
-    uint32_t lo = 0, hi = W25Q_FLASH_SIZE / W25Q_PAGE_SIZE;   /* first erased page is in [lo, hi] */
-    int32_t last;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (page_last_used(d, mid, &last) != HAL_OK) return HAL_ERROR;
-        if (last < 0) hi = mid; else lo = mid + 1;
+    chip_select(flash);
+    HAL_StatusTypeDef result = HAL_SPI_Transmit(flash->spi, &command, 1, SPI_TIMEOUT);
+    if (result == HAL_OK) {
+        result = HAL_SPI_Receive(flash->spi, id_bytes, 3, SPI_TIMEOUT);
     }
-    d->log_addr = 0;
-    if (lo == 0) return HAL_OK;                                 /* empty chip */
-    if (page_last_used(d, lo - 1, &last) != HAL_OK) return HAL_ERROR;
-    d->log_addr = (lo - 1) * W25Q_PAGE_SIZE + (uint32_t)last + 1;
-    return HAL_OK;
+    chip_deselect(flash);
+
+    *id = (id_bytes[0] << 16) | (id_bytes[1] << 8) | id_bytes[2];
+    return result;
 }
 
-HAL_StatusTypeDef W25Q_Init(W25Q_t *dev)
+HAL_StatusTypeDef W25Q_ReadData(W25Q_Handle *flash, uint32_t address, uint8_t *buffer, uint32_t length)
 {
-    uint32_t id;
-    cs_high(dev);
-    /* MCU may have reset mid-erase; let the chip finish first. Capped so a
-     * missing chip (MISO floats high = BUSY) fails in ~2 s instead of 200 s. */
-    if (wait_ready(dev, BLOCK64_ERASE_MS) != HAL_OK) return HAL_ERROR;
-    if (W25Q_ReadJEDECID(dev, &id) != HAL_OK) return HAL_ERROR;
-    if (id != W25Q_JEDEC_ID) return HAL_ERROR;
-    return find_log_end(dev);
-}
+    if (!is_valid_range(address, length)) {
+        return HAL_ERROR;
+    }
 
-HAL_StatusTypeDef W25Q_Read(W25Q_t *dev, uint32_t addr, uint8_t *buf, uint32_t len)
-{
-    if (!in_range(addr, len)) return HAL_ERROR;
-    while (len) {
-        /* Chunked so each HAL call fits its timeout even at slow SPI clocks. */
-        uint16_t chunk = len > W25Q_SECTOR_SIZE ? W25Q_SECTOR_SIZE : (uint16_t)len;
-        uint8_t hdr[4];
-        addr_cmd(hdr, CMD_READ_DATA, addr);
-        if (xfer(dev, hdr, 4, NULL, buf, chunk) != HAL_OK) return HAL_ERROR;
-        addr += chunk; buf += chunk; len -= chunk;
+    // HAL_SPI_Receive can only take 65535 bytes at a time, so big reads are done in 4 KB pieces
+    while (length > 0) {
+        uint16_t piece = (length > 4096) ? 4096 : length;
+
+        chip_select(flash);
+        HAL_StatusTypeDef result = send_command_with_address(flash, CMD_READ_DATA, address);
+        if (result == HAL_OK) {
+            result = HAL_SPI_Receive(flash->spi, buffer, piece, SPI_TIMEOUT);
+        }
+        chip_deselect(flash);
+
+        if (result != HAL_OK) {
+            return result;
+        }
+        address += piece;
+        buffer += piece;
+        length -= piece;
     }
     return HAL_OK;
 }
 
-HAL_StatusTypeDef W25Q_Write(W25Q_t *dev, uint32_t addr, const uint8_t *buf, uint32_t len)
+HAL_StatusTypeDef W25Q_WriteData(W25Q_Handle *flash, uint32_t address, const uint8_t *data, uint32_t length)
 {
-    if (!in_range(addr, len)) return HAL_ERROR;
-    while (len) {
-        /* A page program wraps inside its 256-byte page, so never cross one. */
-        uint32_t chunk = W25Q_PAGE_SIZE - (addr % W25Q_PAGE_SIZE);
-        if (chunk > len) chunk = len;
-        uint8_t hdr[4];
-        addr_cmd(hdr, CMD_PAGE_PROGRAM, addr);
-        if (write_enable(dev) != HAL_OK
-            || xfer(dev, hdr, 4, buf, NULL, (uint16_t)chunk) != HAL_OK
-            || wait_ready(dev, PAGE_PROGRAM_MS) != HAL_OK) return HAL_ERROR;
-        addr += chunk; buf += chunk; len -= chunk;
+    if (!is_valid_range(address, length)) {
+        return HAL_ERROR;
+    }
+
+    while (length > 0) {
+        // One write can't go past the end of a 256 byte page (it would wrap around
+        // to the start of the same page), so only write up to the end of this page
+        uint32_t space_left_in_page = W25Q_PAGE_SIZE - (address % W25Q_PAGE_SIZE);
+        uint32_t piece = (length < space_left_in_page) ? length : space_left_in_page;
+
+        if (write_enable(flash) != HAL_OK) {
+            return HAL_ERROR;
+        }
+
+        chip_select(flash);
+        HAL_StatusTypeDef result = send_command_with_address(flash, CMD_PAGE_PROGRAM, address);
+        if (result == HAL_OK) {
+            result = HAL_SPI_Transmit(flash->spi, (uint8_t *)data, piece, SPI_TIMEOUT);
+        }
+        chip_deselect(flash);
+
+        if (result != HAL_OK || wait_until_ready(flash, PAGE_WRITE_TIMEOUT) != HAL_OK) {
+            return HAL_ERROR;
+        }
+        address += piece;
+        data += piece;
+        length -= piece;
     }
     return HAL_OK;
 }
 
-HAL_StatusTypeDef W25Q_EraseSector(W25Q_t *dev, uint32_t addr)
+// Shared code for sector and block erase
+static HAL_StatusTypeDef erase_area(W25Q_Handle *flash, uint8_t command, uint32_t address, uint32_t timeout_ms)
 {
-    if (!in_range(addr, 1)) return HAL_ERROR;
-    return erase(dev, CMD_SECTOR_ERASE, addr, SECTOR_ERASE_MS);
+    if (!is_valid_range(address, 1)) {
+        return HAL_ERROR;
+    }
+    if (write_enable(flash) != HAL_OK) {
+        return HAL_ERROR;
+    }
+
+    chip_select(flash);
+    HAL_StatusTypeDef result = send_command_with_address(flash, command, address);
+    chip_deselect(flash);
+
+    if (result != HAL_OK) {
+        return result;
+    }
+    return wait_until_ready(flash, timeout_ms);
 }
 
-HAL_StatusTypeDef W25Q_EraseBlock64(W25Q_t *dev, uint32_t addr)
+HAL_StatusTypeDef W25Q_EraseSector(W25Q_Handle *flash, uint32_t address)
 {
-    if (!in_range(addr, 1)) return HAL_ERROR;
-    return erase(dev, CMD_BLOCK64_ERASE, addr, BLOCK64_ERASE_MS);
+    return erase_area(flash, CMD_SECTOR_ERASE, address, SECTOR_ERASE_TIMEOUT);
 }
 
-HAL_StatusTypeDef W25Q_EraseChip(W25Q_t *dev)
+HAL_StatusTypeDef W25Q_EraseBlock(W25Q_Handle *flash, uint32_t address)
 {
-    dev->log_addr = 0;
-    return erase(dev, CMD_CHIP_ERASE, 0, CHIP_ERASE_MS);
+    return erase_area(flash, CMD_BLOCK_ERASE, address, BLOCK_ERASE_TIMEOUT);
 }
 
-HAL_StatusTypeDef W25Q_LogAppend(W25Q_t *dev, const void *data, uint32_t len)
+HAL_StatusTypeDef W25Q_EraseChip(W25Q_Handle *flash)
 {
-    uint8_t rec[W25Q_LOG_MAX_RECORD + 1];
-    if (len == 0 || len > W25Q_LOG_MAX_RECORD) return HAL_ERROR;
-    memcpy(rec, data, len);
-    rec[len] = (uint8_t)len;                    /* trailer, never 0xFF */
-    /* W25Q_Write bounds-checks, so a full chip returns HAL_ERROR, never wraps. */
-    HAL_StatusTypeDef st = W25Q_Write(dev, dev->log_addr, rec, len + 1);
-    if (st == HAL_OK) dev->log_addr += len + 1;
-    return st;
+    if (write_enable(flash) != HAL_OK || send_single_command(flash, CMD_CHIP_ERASE) != HAL_OK) {
+        return HAL_ERROR;
+    }
+    flash->next_log_address = 0;    // the log is empty now
+    return wait_until_ready(flash, CHIP_ERASE_TIMEOUT);
+}
+
+
+// Finds the last byte in a page that isn't 0xFF.
+// Sets last_byte to -1 if the whole page is empty (all 0xFF).
+static HAL_StatusTypeDef find_last_written_byte(W25Q_Handle *flash, uint32_t page, int *last_byte)
+{
+    uint8_t page_data[W25Q_PAGE_SIZE];
+
+    if (W25Q_ReadData(flash, page * W25Q_PAGE_SIZE, page_data, W25Q_PAGE_SIZE) != HAL_OK) {
+        return HAL_ERROR;
+    }
+
+    *last_byte = W25Q_PAGE_SIZE - 1;
+    while (*last_byte >= 0 && page_data[*last_byte] == 0xFF) {
+        (*last_byte)--;
+    }
+    return HAL_OK;
+}
+
+// Finds where the old log data ends so new entries go after it.
+//
+// Every log entry ends with a length byte that is never 0xFF, and no entry is
+// longer than a page, so any page with log data in it has at least one byte
+// that isn't 0xFF. That means the chip always looks like:
+//     [pages with data][empty pages]
+// so we can binary search for the first empty page instead of reading all 16 MB.
+static HAL_StatusTypeDef find_end_of_log(W25Q_Handle *flash)
+{
+    uint32_t low = 0;
+    uint32_t high = W25Q_TOTAL_PAGES;   // the first empty page is somewhere from low to high
+    int last_byte;
+
+    while (low < high) {
+        uint32_t middle = (low + high) / 2;
+
+        if (find_last_written_byte(flash, middle, &last_byte) != HAL_OK) {
+            return HAL_ERROR;
+        }
+
+        if (last_byte == -1) {
+            high = middle;      // middle page is empty, so the log ends at or before it
+        } else {
+            low = middle + 1;   // middle page has data, so the log ends after it
+        }
+    }
+
+    if (low == 0) {
+        flash->next_log_address = 0;    // nothing logged yet
+        return HAL_OK;
+    }
+
+    // "low" is the first empty page, so the log ends inside the page before it
+    if (find_last_written_byte(flash, low - 1, &last_byte) != HAL_OK) {
+        return HAL_ERROR;
+    }
+    flash->next_log_address = (low - 1) * W25Q_PAGE_SIZE + last_byte + 1;
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef W25Q_Init(W25Q_Handle *flash)
+{
+    chip_deselect(flash);
+
+    // If the board reset in the middle of an erase, give the chip time to finish.
+    // (If the chip isn't connected this also stops us from waiting forever.)
+    if (wait_until_ready(flash, BLOCK_ERASE_TIMEOUT) != HAL_OK) {
+        return HAL_ERROR;
+    }
+
+    uint32_t id = 0;
+    if (W25Q_ReadID(flash, &id) != HAL_OK || id != W25Q_EXPECTED_ID) {
+        return HAL_ERROR;
+    }
+
+    return find_end_of_log(flash);
+}
+
+HAL_StatusTypeDef W25Q_LogData(W25Q_Handle *flash, const void *data, uint32_t length)
+{
+    uint8_t entry[W25Q_MAX_LOG_ENTRY + 1];
+
+    if (length == 0 || length > W25Q_MAX_LOG_ENTRY) {
+        return HAL_ERROR;
+    }
+
+    // Entry = the data, then one byte saying how long the data was
+    memcpy(entry, data, length);
+    entry[length] = length;
+
+    // W25Q_WriteData returns an error if the chip is full, so the log never wraps around
+    HAL_StatusTypeDef result = W25Q_WriteData(flash, flash->next_log_address, entry, length + 1);
+    if (result == HAL_OK) {
+        flash->next_log_address += length + 1;
+    }
+    return result;
 }
